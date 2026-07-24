@@ -1,0 +1,1594 @@
+<!doctype html>
+<html lang="da">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1" />
+<meta name="theme-color" content="#3FA9A4" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Timeoversigt" />
+<meta name="mobile-web-app-capable" content="yes" />
+<title>Timeoversigt</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18",
+    "react-dom/client": "https://esm.sh/react-dom@18/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react",
+    "xlsx": "https://esm.sh/xlsx@0.18.5"
+  }
+}
+</script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body, #root { margin: 0; padding: 0; min-height: 100vh; min-height: 100dvh; background: #F5F5F7; }
+  * { -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react" data-type="module">
+import React, { useState, useEffect, useMemo } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  Plus, Trash2, X, Check, ChevronRight, Settings, Camera, FileSpreadsheet, Home, Archive, Pencil, Moon, Clock,
+} from "lucide-react";
+import * as XLSX from "xlsx";
+
+// Local storage shim — replaces the Claude-artifact-specific window.storage API
+// so the app persists data normally in a real browser / installed PWA.
+const storage = {
+  async get(key) {
+    try {
+      const value = localStorage.getItem(key);
+      return value !== null ? { key, value } : null;
+    } catch {
+      return null;
+    }
+  },
+  async set(key, value) {
+    try {
+      localStorage.setItem(key, value);
+      return { key, value };
+    } catch {
+      return null;
+    }
+  },
+};
+
+const EXPENSE_CATEGORIES = ["Parkering", "BroBizz", "Materialer", "Transport", "Kost", "Andet"];
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+function formatDKK(n) {
+  return new Intl.NumberFormat("da-DK", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n || 0);
+}
+function formatHours(n) {
+  return formatDKK(n).replace(",00", "");
+}
+function formatDateDK(iso) {
+  const [y, m, d] = iso.split("-");
+  return `${d}.${m}.${y}`;
+}
+function weekdayDK(iso) {
+  const days = ["søndag", "mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag"];
+  const d = new Date(iso + "T12:00:00");
+  return days[d.getDay()];
+}
+function isoWeek(iso) {
+  const d = new Date(iso + "T12:00:00");
+  const target = new Date(d.valueOf());
+  const dayNr = (d.getDay() + 6) % 7;
+  target.setDate(target.getDate() - dayNr + 3);
+  const firstThursday = new Date(target.getFullYear(), 0, 4);
+  const diff = target - firstThursday;
+  return 1 + Math.round(diff / (7 * 24 * 3600 * 1000));
+}
+function timeToMinutes(t) {
+  const [h, m] = t.split(":").map(Number);
+  return h * 60 + m;
+}
+function computeHoursFromRange(start, end) {
+  let diff = timeToMinutes(end) - timeToMinutes(start);
+  if (diff < 0) diff += 24 * 60;
+  return Math.round((diff / 60) * 100) / 100;
+}
+function hm(h, m) {
+  return (parseFloat(String(h).replace(",", ".")) || 0) + (parseFloat(String(m).replace(",", ".")) || 0) / 60;
+}
+function decToHM(dec) {
+  const h = Math.floor(dec);
+  const m = Math.round((dec - h) * 60);
+  return { h: h ? String(h) : "", m: m ? String(m) : "" };
+}
+function vatSplit(amount, rate, inclusive) {
+  const amt = amount || 0;
+  if (inclusive) {
+    const net = amt / (1 + rate / 100);
+    return { net, vat: amt - net, gross: amt };
+  }
+  const vat = amt * (rate / 100);
+  return { net: amt, vat, gross: amt + vat };
+}
+function entryAmount(e) {
+  const base = (e.hours || 0) * (e.hourlyRate || 0);
+  const nightBonus = (e.nightHours || 0) * (e.nightRate || 0);
+  return base + nightBonus;
+}
+function staffCost(e) {
+  const base = (e.hours || 0) * (e.hourlyWage || 0);
+  const nightBonus = (e.nightHours || 0) * (e.nightRate || 0);
+  return base + nightBonus;
+}
+function fileToCompressedDataUrl(file, maxDim = 1000, quality = 0.7) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Kunne ikke læse filen"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Kunne ikke læse billedet"));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          const scale = maxDim / Math.max(width, height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+const emptyCustomerForm = { name: "", hourlyRate: "", nightRate: "" };
+const emptyEmployeeForm = { name: "", hourlyWage: "", nightRate: "" };
+function newJobRow() {
+  return { id: uid(), project: "", h: "", m: "", note: "" };
+}
+function newExpenseRow() {
+  return { id: uid(), category: EXPENSE_CATEGORIES[0], amount: "", vatRate: "25", vatIncl: true, note: "", receiptImage: null };
+}
+function newStaffRow() {
+  return { id: uid(), employeeId: "", h: "", m: "", nightH: "", nightM: "", note: "" };
+}
+function emptyDraft() {
+  return {
+    customerId: "",
+    hourlyRate: "",
+    nightRate: "",
+    nightH: "",
+    nightM: "",
+    date: todayISO(),
+    start: "",
+    end: "",
+    manualH: "",
+    manualM: "",
+    privateH: "",
+    privateM: "",
+    jobs: [newJobRow()],
+    staff: [newStaffRow()],
+    expenses: [newExpenseRow()],
+    note: "",
+  };
+}
+
+const inputCls = "w-full bg-[#F0F0F3] border border-[#E2E2E6] rounded-lg px-3 py-2.5 text-sm text-[#1C1C1E] focus:outline-none focus:border-[#3FA9A4]";
+const readonlyCls = "w-full bg-[#EDEDF1] border border-[#E2E2E6] rounded-lg px-3 py-2.5 text-sm text-[#8E8E93]";
+
+function Field({ label, children }) {
+  return (
+    <div>
+      {label && <label className="block text-xs text-[#8E8E93] mb-1">{label}</label>}
+      {children}
+    </div>
+  );
+}
+function PrimaryButton({ onClick, children, disabled }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        width: "100%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 8,
+        backgroundColor: disabled ? "#3FA9A466" : "#3FA9A4",
+        color: "#ffffff",
+        borderRadius: 8,
+        padding: "12px 16px",
+        fontSize: 14,
+        fontWeight: 600,
+        border: "none",
+        cursor: disabled ? "not-allowed" : "pointer",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+function ModalShell({ title, onClose, onSave, saveLabel = "OK", subHeader, children }) {
+  return (
+    <div className="no-print fixed inset-0 bg-black/30 z-40 flex items-end sm:items-center justify-center" onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} className="bg-white w-full sm:max-w-md sm:rounded-t-2xl sm:rounded-2xl rounded-t-2xl" style={{ maxHeight: "88vh", overflowY: "auto" }}>
+        <div style={{ position: "sticky", top: 0, backgroundColor: "#ffffff", zIndex: 20 }}>
+          <div className="flex items-center justify-between px-4 py-3 border-b border-[#E2E2E6]">
+            <button onClick={onClose} className="text-[#8E8E93] p-1"><X size={20} /></button>
+            <span className="text-base font-medium">{title}</span>
+            <button onClick={onSave} className="text-[#3FA9A4] font-medium text-sm px-1">{saveLabel}</button>
+          </div>
+          {subHeader}
+        </div>
+        <div className="p-4 space-y-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [entries, setEntries] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [jobNames, setJobNames] = useState([]);
+  const [employees, setEmployees] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [page, setPage] = useState("registrering"); // registrering | arkiv | eksport
+
+  const [draft, setDraft] = useState(emptyDraft());
+  const [editingIds, setEditingIds] = useState(null); // ids of entries currently being edited from arkiv
+
+  const [showTimeModal, setShowTimeModal] = useState(false);
+  const [showNightModal, setShowNightModal] = useState(false);
+  const [showJobsModal, setShowJobsModal] = useState(false);
+  const [showCustomerModal, setShowCustomerModal] = useState(false);
+  const [showStaffModal, setShowStaffModal] = useState(false);
+  const [showExpensesModal, setShowExpensesModal] = useState(false);
+  const [customerForm, setCustomerForm] = useState(emptyCustomerForm);
+  const [editingCustomerId, setEditingCustomerId] = useState(null);
+  const [employeeForm, setEmployeeForm] = useState(emptyEmployeeForm);
+  const [editingEmployeeId, setEditingEmployeeId] = useState(null);
+  const [addingEmpFor, setAddingEmpFor] = useState(null); // staff row id currently adding a new employee
+  const [newEmpNameInput, setNewEmpNameInput] = useState("");
+  const [newEmpWageInput, setNewEmpWageInput] = useState("");
+  const [newEmpNightRateInput, setNewEmpNightRateInput] = useState("");
+  const [newJobNameInput, setNewJobNameInput] = useState("");
+  const [addingJobFor, setAddingJobFor] = useState(null); // row id currently adding a new job name
+  const [uploadingReceipt, setUploadingReceipt] = useState(null);
+  const [lightboxImage, setLightboxImage] = useState(null);
+
+  const [exportFrom, setExportFrom] = useState("");
+  const [exportTo, setExportTo] = useState("");
+  const [exportCustomer, setExportCustomer] = useState("Alle");
+  const [exportFormat, setExportFormat] = useState("numbers"); // numbers | pdf
+  const [exportStatus, setExportStatus] = useState(null);
+  const [saveStatus, setSaveStatus] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await storage.get("entries");
+        if (res && res.value) setEntries(JSON.parse(res.value));
+      } catch (e) {}
+      try {
+        const res2 = await storage.get("customers");
+        if (res2 && res2.value) setCustomers(JSON.parse(res2.value));
+      } catch (e) {}
+      try {
+        const res3 = await storage.get("jobNames");
+        if (res3 && res3.value) setJobNames(JSON.parse(res3.value));
+      } catch (e) {}
+      try {
+        const res4 = await storage.get("employees");
+        if (res4 && res4.value) setEmployees(JSON.parse(res4.value));
+      } catch (e) {}
+      setLoaded(true);
+    })();
+  }, []);
+  useEffect(() => {
+    if (!loaded) return;
+    storage.set("entries", JSON.stringify(entries)).catch(() => {});
+  }, [entries, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    storage.set("customers", JSON.stringify(customers)).catch(() => {});
+  }, [customers, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    storage.set("jobNames", JSON.stringify(jobNames)).catch(() => {});
+  }, [jobNames, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    storage.set("employees", JSON.stringify(employees)).catch(() => {});
+  }, [employees, loaded]);
+
+
+  // Seed job list from any project names already used historically
+  useEffect(() => {
+    if (!loaded) return;
+    const historical = new Set(entries.filter((e) => e.type === "tid").map((e) => e.project).filter(Boolean));
+    setJobNames((prev) => {
+      const merged = new Set([...prev, ...historical]);
+      if (merged.size === prev.length) return prev;
+      return Array.from(merged).sort((a, b) => a.localeCompare(b, "da"));
+    });
+    // eslint-disable-next-line
+  }, [loaded]);
+
+  function addJobName(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setJobNames((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed].sort((a, b) => a.localeCompare(b, "da"))));
+  }
+  function removeJobName(name) {
+    setJobNames((prev) => prev.filter((n) => n !== name));
+  }
+
+
+  function customerName(id) {
+    const c = customers.find((x) => x.id === id);
+    return c ? c.name : "";
+  }
+
+  // ---------- Time computation for the draft ----------
+  const totalHours = useMemo(() => {
+    if (draft.start && draft.end) return computeHoursFromRange(draft.start, draft.end);
+    return hm(draft.manualH, draft.manualM);
+  }, [draft.start, draft.end, draft.manualH, draft.manualM]);
+  const privateHours = hm(draft.privateH, draft.privateM);
+  const arbejdstimer = Math.max(0, Math.round((totalHours - privateHours) * 100) / 100);
+  const nightHoursValue = Math.min(hm(draft.nightH, draft.nightM), arbejdstimer);
+
+  const jobsTotal = useMemo(() => draft.jobs.reduce((s, j) => s + hm(j.h, j.m), 0), [draft.jobs]);
+  const staffTotalDraft = useMemo(() => draft.staff.reduce((s, x) => s + hm(x.h, x.m), 0), [draft.staff]);
+  const validExpensesDraft = useMemo(() => draft.expenses.filter((x) => (parseFloat(String(x.amount).replace(",", ".")) || 0) > 0), [draft.expenses]);
+  const expensesTotalDraft = useMemo(() => validExpensesDraft.reduce((s, x) => s + (parseFloat(String(x.amount).replace(",", ".")) || 0), 0), [validExpensesDraft]);
+
+  // ---------- Customers ----------
+  function saveCustomer() {
+    if (!customerForm.name.trim()) return;
+    const payload = {
+      name: customerForm.name.trim(),
+      hourlyRate: parseFloat(String(customerForm.hourlyRate).replace(",", ".")) || 0,
+      nightRate: parseFloat(String(customerForm.nightRate).replace(",", ".")) || 0,
+    };
+    if (editingCustomerId) {
+      setCustomers((prev) => prev.map((c) => (c.id === editingCustomerId ? { ...c, ...payload } : c)));
+      setEditingCustomerId(null);
+    } else {
+      const newCust = { id: uid(), ...payload };
+      setCustomers((prev) => [...prev, newCust]);
+      setDraft((d) => ({ ...d, customerId: newCust.id, hourlyRate: String(newCust.hourlyRate), nightRate: String(newCust.nightRate) }));
+    }
+    setCustomerForm(emptyCustomerForm);
+  }
+  function removeCustomer(id) {
+    setCustomers((prev) => prev.filter((c) => c.id !== id));
+    if (draft.customerId === id) setDraft((d) => ({ ...d, customerId: "", hourlyRate: "" }));
+  }
+  function pickCustomer(id) {
+    const c = customers.find((x) => x.id === id);
+    setDraft((d) => ({ ...d, customerId: id, hourlyRate: c ? String(c.hourlyRate) : d.hourlyRate, nightRate: c ? String(c.nightRate || "") : d.nightRate }));
+    setShowCustomerModal(false);
+  }
+
+  // ---------- Employees ----------
+  function saveEmployee() {
+    if (!employeeForm.name.trim()) return;
+    const payload = {
+      name: employeeForm.name.trim(),
+      hourlyWage: parseFloat(String(employeeForm.hourlyWage).replace(",", ".")) || 0,
+      nightRate: parseFloat(String(employeeForm.nightRate).replace(",", ".")) || 0,
+    };
+    if (editingEmployeeId) {
+      setEmployees((prev) => prev.map((emp) => (emp.id === editingEmployeeId ? { ...emp, ...payload } : emp)));
+      setEditingEmployeeId(null);
+    } else {
+      setEmployees((prev) => [...prev, { id: uid(), ...payload }]);
+    }
+    setEmployeeForm(emptyEmployeeForm);
+  }
+  function addEmployeeName(name, wage, nightRate) {
+    const trimmed = name.trim();
+    if (!trimmed) return null;
+    const existing = employees.find((e) => e.name.toLowerCase() === trimmed.toLowerCase());
+    if (existing) return existing.id;
+    const newEmp = {
+      id: uid(),
+      name: trimmed,
+      hourlyWage: parseFloat(String(wage).replace(",", ".")) || 0,
+      nightRate: parseFloat(String(nightRate).replace(",", ".")) || 0,
+    };
+    setEmployees((prev) => [...prev, newEmp]);
+    return newEmp.id;
+  }
+  function removeEmployee(id) {
+    setEmployees((prev) => prev.filter((emp) => emp.id !== id));
+    setDraft((d) => ({ ...d, staff: d.staff.map((s) => (s.employeeId === id ? { ...s, employeeId: "" } : s)) }));
+  }
+  function updateStaff(id, patch) {
+    setDraft((d) => ({ ...d, staff: d.staff.map((s) => (s.id === id ? { ...s, ...patch } : s)) }));
+  }
+  function addStaffRow() {
+    setDraft((d) => ({ ...d, staff: [...d.staff, newStaffRow()] }));
+  }
+  function removeStaffRow(id) {
+    setDraft((d) => ({ ...d, staff: d.staff.length > 1 ? d.staff.filter((s) => s.id !== id) : d.staff }));
+  }
+  function employeeName(id) {
+    const emp = employees.find((x) => x.id === id);
+    return emp ? emp.name : "";
+  }
+
+  // ---------- Jobs modal ----------
+  function updateJob(id, patch) {
+    setDraft((d) => ({ ...d, jobs: d.jobs.map((j) => (j.id === id ? { ...j, ...patch } : j)) }));
+  }
+  function addJobRow() {
+    setDraft((d) => ({ ...d, jobs: [...d.jobs, newJobRow()] }));
+  }
+  function removeJobRow(id) {
+    setDraft((d) => ({ ...d, jobs: d.jobs.length > 1 ? d.jobs.filter((j) => j.id !== id) : d.jobs }));
+  }
+
+  // ---------- Expenses ----------
+  function updateExpense(id, patch) {
+    setDraft((d) => ({ ...d, expenses: d.expenses.map((x) => (x.id === id ? { ...x, ...patch } : x)) }));
+  }
+  function addExpenseRow() {
+    setDraft((d) => ({ ...d, expenses: [...d.expenses, newExpenseRow()] }));
+  }
+  function removeExpenseRow(id) {
+    setDraft((d) => ({ ...d, expenses: d.expenses.length > 1 ? d.expenses.filter((x) => x.id !== id) : d.expenses }));
+  }
+  async function handleReceiptSelect(id, file) {
+    if (!file) return;
+    setUploadingReceipt(id);
+    try {
+      const dataUrl = await fileToCompressedDataUrl(file);
+      updateExpense(id, { receiptImage: dataUrl });
+    } catch (e) {
+    } finally {
+      setUploadingReceipt(null);
+    }
+  }
+
+  // ---------- Save registration ----------
+  function saveRegistration() {
+    const validJobs = draft.jobs.filter((j) => j.project.trim() && hm(j.h, j.m) > 0);
+    const rate = parseFloat(String(draft.hourlyRate).replace(",", ".")) || 0;
+    const nightRateVal = parseFloat(String(draft.nightRate).replace(",", ".")) || 0;
+    let remainingNightHours = nightHoursValue;
+    const generalNote = draft.note.trim();
+    const newTidEntries = validJobs.map((j, i) => {
+      const jobHours = hm(j.h, j.m);
+      const nightForThisJob = Math.min(remainingNightHours, jobHours);
+      remainingNightHours = Math.max(0, remainingNightHours - nightForThisJob);
+      return {
+        id: uid(),
+        type: "tid",
+        date: draft.date,
+        customerId: draft.customerId,
+        hourlyRate: rate,
+        nightRate: nightRateVal,
+        nightHours: Math.round(nightForThisJob * 100) / 100,
+        project: j.project.trim(),
+        hours: jobHours,
+        note: i === 0 && generalNote ? [j.note.trim(), generalNote].filter(Boolean).join(" — ") : j.note.trim(),
+      };
+    });
+    const validExpenses = draft.expenses.filter((x) => (parseFloat(String(x.amount).replace(",", ".")) || 0) > 0);
+    const newUdlaegEntries = validExpenses.map((x, i) => ({
+      id: uid(),
+      type: "udlaeg",
+      date: draft.date,
+      customerId: draft.customerId,
+      amount: parseFloat(String(x.amount).replace(",", ".")),
+      vatRate: parseFloat(x.vatRate) || 0,
+      vatIncl: x.vatIncl,
+      category: x.category,
+      note: validJobs.length === 0 && i === 0 && generalNote ? [x.note.trim(), generalNote].filter(Boolean).join(" — ") : x.note.trim(),
+      receiptImage: x.receiptImage || null,
+    }));
+    const validStaff = draft.staff.filter((s) => s.employeeId && hm(s.h, s.m) > 0);
+    const newStaffEntries = validStaff.map((s) => {
+      const emp = employees.find((x) => x.id === s.employeeId);
+      const staffHours = hm(s.h, s.m);
+      const staffNightHours = Math.min(hm(s.nightH, s.nightM), staffHours);
+      return {
+        id: uid(),
+        type: "personale",
+        date: draft.date,
+        customerId: draft.customerId,
+        employeeId: s.employeeId,
+        hourlyWage: emp ? emp.hourlyWage : 0,
+        nightRate: emp ? emp.nightRate : 0,
+        hours: staffHours,
+        nightHours: Math.round(staffNightHours * 100) / 100,
+        note: s.note.trim(),
+      };
+    });
+    if (newTidEntries.length === 0 && newUdlaegEntries.length === 0 && newStaffEntries.length === 0) return;
+
+    if (editingIds) {
+      setEntries((prev) => [
+        ...prev.filter((e) => !editingIds.includes(e.id)),
+        ...newTidEntries,
+        ...newUdlaegEntries,
+        ...newStaffEntries,
+      ]);
+      setEditingIds(null);
+    } else {
+      setEntries((prev) => [...newTidEntries, ...newUdlaegEntries, ...newStaffEntries, ...prev]);
+    }
+    setDraft({ ...emptyDraft(), customerId: draft.customerId, hourlyRate: draft.hourlyRate, date: draft.date });
+    setPage("registrering");
+    setSaveStatus("Registrering gemt ✓ — se den under Arkiv. Landingssiden er ryddet til en ny registrering.");
+    setTimeout(() => setSaveStatus(null), 5000);
+  }
+
+  function editRegistration(date, customerId) {
+    const group = entries.filter((e) => e.date === date && (e.customerId || "") === (customerId || ""));
+    const tidGroup = group.filter((e) => e.type === "tid");
+    const udlaegGroup = group.filter((e) => e.type === "udlaeg");
+    const staffGroup = group.filter((e) => e.type === "personale");
+    const totalNightHours = tidGroup.reduce((s, e) => s + (e.nightHours || 0), 0);
+    const { h: nightH, m: nightM } = decToHM(totalNightHours);
+    setDraft({
+      customerId: customerId || "",
+      hourlyRate: tidGroup[0] ? String(tidGroup[0].hourlyRate ?? "") : "",
+      nightRate: tidGroup[0] && tidGroup[0].nightRate ? String(tidGroup[0].nightRate) : "",
+      nightH,
+      nightM,
+      date,
+      start: "",
+      end: "",
+      manualH: "",
+      manualM: "",
+      privateH: "",
+      privateM: "",
+      jobs: tidGroup.length
+        ? tidGroup.map((e) => { const { h, m } = decToHM(e.hours); return { id: e.id, project: e.project, h, m, note: e.note || "" }; })
+        : [newJobRow()],
+      staff: staffGroup.length
+        ? staffGroup.map((e) => {
+            const { h, m } = decToHM(e.hours);
+            const { h: nh, m: nm } = decToHM(e.nightHours || 0);
+            return { id: e.id, employeeId: e.employeeId, h, m, nightH: nh, nightM: nm, note: e.note || "" };
+          })
+        : [newStaffRow()],
+      expenses: udlaegGroup.length
+        ? udlaegGroup.map((e) => ({ id: e.id, category: e.category, amount: String(e.amount), vatRate: String(e.vatRate ?? 25), vatIncl: e.vatIncl !== false, note: e.note || "", receiptImage: e.receiptImage || null }))
+        : [newExpenseRow()],
+      note: "",
+    });
+    setEditingIds(group.map((e) => e.id));
+    setPage("registrering");
+  }
+
+  function deleteRegistration(date, customerId) {
+    setEntries((prev) => prev.filter((e) => !(e.date === date && (e.customerId || "") === (customerId || ""))));
+  }
+
+  // ---------- Arkiv grouping ----------
+  const archiveGroups = useMemo(() => {
+    const map = {};
+    entries.forEach((e) => {
+      const key = `${e.date}__${e.customerId || ""}`;
+      if (!map[key]) map[key] = { date: e.date, customerId: e.customerId || "", tid: [], udlaeg: [], personale: [] };
+      if (e.type === "tid") map[key].tid.push(e);
+      else if (e.type === "personale") map[key].personale.push(e);
+      else map[key].udlaeg.push(e);
+    });
+    return Object.values(map).sort((a, b) => (a.date < b.date ? 1 : -1));
+  }, [entries]);
+
+  // ---------- Export ----------
+  const exportEntries = useMemo(() => {
+    return entries.filter((e) => {
+      if (exportFrom && e.date < exportFrom) return false;
+      if (exportTo && e.date > exportTo) return false;
+      if (exportCustomer !== "Alle" && (e.customerId || "") !== exportCustomer) return false;
+      return true;
+    });
+  }, [entries, exportFrom, exportTo, exportCustomer]);
+
+  const exportByDate = useMemo(() => {
+    const map = {};
+    exportEntries.forEach((e) => {
+      if (!map[e.date]) map[e.date] = { tid: [], udlaeg: [], personale: [] };
+      if (e.type === "tid") map[e.date].tid.push(e);
+      else if (e.type === "personale") map[e.date].personale.push(e);
+      else map[e.date].udlaeg.push(e);
+    });
+    return Object.keys(map).sort((a, b) => (a < b ? -1 : 1)).map((date) => ({ date, ...map[date] }));
+  }, [exportEntries]);
+
+  async function exportXlsx() {
+    const tid = exportEntries.filter((e) => e.type === "tid");
+    const udlaeg = exportEntries.filter((e) => e.type === "udlaeg");
+    const personale = exportEntries.filter((e) => e.type === "personale");
+
+    const wb = XLSX.utils.book_new();
+    const tidRows = [
+      ["Dato", "Ugedag", "Kunde", "Job/projekt", "Timer", "Timesats", "Nattetimer", "Nattillæg/t", "Beløb", "Note"],
+      ...tid.sort((a, b) => (a.date < b.date ? -1 : 1)).map((e) => [
+        formatDateDK(e.date), weekdayDK(e.date), customerName(e.customerId), e.project, e.hours,
+        e.hourlyRate || 0, e.nightHours || 0, e.nightRate || 0, Number(entryAmount(e).toFixed(2)), e.note,
+      ]),
+      [],
+      ["", "", "", "I alt", Number(tid.reduce((s, e) => s + e.hours, 0).toFixed(2)), "", "", "", Number(tid.reduce((s, e) => s + entryAmount(e), 0).toFixed(2)), ""],
+    ];
+    const wsTid = XLSX.utils.aoa_to_sheet(tidRows);
+    wsTid["!cols"] = [{ wch: 12 }, { wch: 10 }, { wch: 16 }, { wch: 20 }, { wch: 8 }, { wch: 10 }, { wch: 10 }, { wch: 11 }, { wch: 12 }, { wch: 30 }];
+    XLSX.utils.book_append_sheet(wb, wsTid, "Timer");
+
+    const udlaegRows = [
+      ["Dato", "Kunde", "Kategori", "Beløb inkl. moms", "Moms", "Beløb ekskl. moms", "Kvittering", "Note"],
+      ...udlaeg.sort((a, b) => (a.date < b.date ? -1 : 1)).map((e) => {
+        const { net, vat, gross } = vatSplit(e.amount, e.vatRate ?? 25, e.vatIncl !== false);
+        return [formatDateDK(e.date), customerName(e.customerId), e.category, Number(gross.toFixed(2)), Number(vat.toFixed(2)), Number(net.toFixed(2)), e.receiptImage ? "Ja" : "", e.note];
+      }),
+      [],
+      [
+        "", "", "I alt",
+        Number(udlaeg.reduce((s, e) => s + vatSplit(e.amount, e.vatRate ?? 25, e.vatIncl !== false).gross, 0).toFixed(2)),
+        Number(udlaeg.reduce((s, e) => s + vatSplit(e.amount, e.vatRate ?? 25, e.vatIncl !== false).vat, 0).toFixed(2)),
+        Number(udlaeg.reduce((s, e) => s + vatSplit(e.amount, e.vatRate ?? 25, e.vatIncl !== false).net, 0).toFixed(2)),
+        "", "",
+      ],
+    ];
+    const wsUdlaeg = XLSX.utils.aoa_to_sheet(udlaegRows);
+    wsUdlaeg["!cols"] = [{ wch: 12 }, { wch: 16 }, { wch: 14 }, { wch: 16 }, { wch: 10 }, { wch: 16 }, { wch: 10 }, { wch: 30 }];
+    XLSX.utils.book_append_sheet(wb, wsUdlaeg, "Udlæg");
+
+    if (personale.length > 0) {
+      const personaleRows = [
+        ["Dato", "Kunde", "Medarbejder", "Timer", "Timeløn", "Nattetimer", "Nattillæg/t", "Omkostning", "Note"],
+        ...personale.sort((a, b) => (a.date < b.date ? -1 : 1)).map((e) => [
+          formatDateDK(e.date), customerName(e.customerId), employeeName(e.employeeId), e.hours,
+          e.hourlyWage || 0, e.nightHours || 0, e.nightRate || 0, Number(staffCost(e).toFixed(2)), e.note,
+        ]),
+        [],
+        ["", "", "I alt", Number(personale.reduce((s, e) => s + e.hours, 0).toFixed(2)), "", "", "", Number(personale.reduce((s, e) => s + staffCost(e), 0).toFixed(2)), ""],
+      ];
+      const wsPersonale = XLSX.utils.aoa_to_sheet(personaleRows);
+      wsPersonale["!cols"] = [{ wch: 12 }, { wch: 16 }, { wch: 16 }, { wch: 8 }, { wch: 10 }, { wch: 10 }, { wch: 11 }, { wch: 12 }, { wch: 30 }];
+      XLSX.utils.book_append_sheet(wb, wsPersonale, "Medarbejdere");
+    }
+
+    const rangeLabel = exportFrom || exportTo ? `_${exportFrom || "start"}_til_${exportTo || "nu"}` : "";
+    const filename = `Timeoversigt${rangeLabel}.xlsx`;
+
+    setExportStatus("Klargør fil…");
+    try {
+      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      const blob = new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const file = new File([blob], filename, { type: blob.type });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: filename });
+        setExportStatus("Delt.");
+        return;
+      }
+      // Fallback: trigger a normal browser download
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      setExportStatus("Downloadet — tjek din browsers download-mappe eller Filer-app.");
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        setExportStatus(null);
+      } else {
+        setExportStatus("Kunne ikke dele/downloade filen. Prøv igen, eller brug PDF-format i stedet.");
+      }
+    }
+  }
+
+  function exportPdf() {
+    window.print();
+  }
+
+
+  return (
+    <div className="min-h-screen bg-[#F5F5F7] text-[#1C1C1E] pb-36" style={{ fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+      <style>{`
+        .print-only { display: none; }
+        @media print {
+          .no-print { display: none !important; }
+          .print-only { display: block !important; }
+        }
+      `}</style>
+      <header className="no-print bg-white border-b border-[#E2E2E6] px-4 py-3 sticky top-0 z-10">
+        <div className="max-w-lg mx-auto flex items-center justify-between">
+          <h1 className="text-base font-semibold">
+            {page === "registrering" && (editingIds ? "Registrering (rediger)" : "Registrering")}
+            {page === "arkiv" && "Arkiv"}
+            {page === "eksport" && "Eksportér"}
+          </h1>
+        </div>
+      </header>
+
+      <main className="no-print max-w-lg mx-auto px-4 py-4 space-y-4">
+        {page === "registrering" && (
+          <>
+            {saveStatus && (
+              <div style={{ backgroundColor: "#EFFBFA", border: "1px solid #3FA9A4", color: "#2C8580", borderRadius: 8, padding: "8px 12px", fontSize: 13, fontWeight: 500, textAlign: "center" }}>
+                {saveStatus}
+              </div>
+            )}
+            {editingIds && (
+              <div className="flex items-center justify-between text-xs text-[#3FA9A4] px-1">
+                <span>Redigerer eksisterende registrering</span>
+                <button onClick={() => { setEditingIds(null); setDraft(emptyDraft()); }} className="text-[#8E8E93]">Annullér</button>
+              </div>
+            )}
+
+            {/* Row 1 + 2: Kunde, Timesats, Dato, Tid */}
+            <div className="bg-white rounded-xl border border-[#E2E2E6] shadow-sm p-4 space-y-4">
+              <div className="grid grid-cols-3 gap-2">
+                <div className="col-span-2">
+                  <Field label="Kunde">
+                    <div className="flex gap-2">
+                      <select
+                        value={draft.customerId}
+                        onChange={(e) => pickCustomer(e.target.value)}
+                        className={inputCls + " font-semibold"}
+                      >
+                        <option value="">Vælg kunde</option>
+                        {customers.map((c) => (
+                          <option key={c.id} value={c.id}>{c.name}</option>
+                        ))}
+                      </select>
+                      <button onClick={() => setShowCustomerModal(true)} className="bg-[#F0F0F3] border border-[#E2E2E6] rounded-lg px-3 text-[#3FA9A4] shrink-0">
+                        <Settings size={16} />
+                      </button>
+                    </div>
+                  </Field>
+                </div>
+                <Field label="Timesats">
+                  <input type="text" inputMode="decimal" placeholder="0" value={draft.hourlyRate} onChange={(e) => setDraft({ ...draft, hourlyRate: e.target.value })} className={inputCls} />
+                </Field>
+              </div>
+
+              <div className="flex items-end gap-2">
+                <div className="w-28 shrink-0">
+                  <Field label={`${weekdayDK(draft.date).charAt(0).toUpperCase()}${weekdayDK(draft.date).slice(1)}, uge ${isoWeek(draft.date)}`}>
+                    <input type="date" value={draft.date} onChange={(e) => setDraft({ ...draft, date: e.target.value })} className={inputCls + " px-1.5"} />
+                  </Field>
+                </div>
+                <div className="w-16 shrink-0">
+                  <Field label="Timer">
+                    <div className={readonlyCls + " text-center font-semibold text-[#1C1C1E] px-1"}>{formatHours(arbejdstimer)}</div>
+                  </Field>
+                </div>
+                <div className="flex gap-1 mb-0.5 shrink-0">
+                  <button onClick={() => setShowTimeModal(true)} className="bg-[#F0F0F3] border border-[#E2E2E6] rounded-lg p-2.5 text-[#3FA9A4]">
+                    <Clock size={18} />
+                  </button>
+                  <button
+                    onClick={() => setShowNightModal(true)}
+                    className="rounded-lg p-2.5 border"
+                    style={nightHoursValue > 0 ? { backgroundColor: "#3FA9A4", borderColor: "#3FA9A4", color: "#ffffff" } : { backgroundColor: "#F0F0F3", borderColor: "#E2E2E6", color: "#3FA9A4" }}
+                  >
+                    <Moon size={18} />
+                  </button>
+                </div>
+              </div>
+              {(draft.start || draft.manualH) && (
+                <p className="text-xs text-[#8E8E93] -mt-2 px-1">
+                  {draft.start ? `${draft.start} – ${draft.end || "…"}` : `${formatHours(totalHours)} t`}
+                  {privateHours > 0 ? ` / ${formatHours(privateHours * 60)} min privat` : ""}
+                  {nightHoursValue > 0 ? ` / ${formatHours(nightHoursValue)} t nattillæg` : ""}
+                </p>
+              )}
+            </div>
+
+            {/* Row 3: Arbejde og udlæg */}
+            <div className="bg-white rounded-xl border border-[#E2E2E6] shadow-sm divide-y divide-[#E2E2E6] overflow-hidden">
+              <button onClick={() => setShowJobsModal(true)} className="w-full flex items-center justify-between px-4 py-3.5">
+                <span className="text-sm text-[#1C1C1E]">Fordel på jobs</span>
+                <span className="flex items-center gap-2 text-xs text-[#8E8E93]">
+                  {draft.jobs.filter((j) => j.project.trim()).length > 0 ? `${formatHours(jobsTotal)} t på ${draft.jobs.filter((j) => j.project.trim()).length} job` : "Ikke fordelt"}
+                  <ChevronRight size={16} className="text-[#B4B4BA]" />
+                </span>
+              </button>
+              <button onClick={() => setShowStaffModal(true)} className="w-full flex items-center justify-between px-4 py-3.5">
+                <span className="text-sm text-[#1C1C1E]">Medarbejdere</span>
+                <span className="flex items-center gap-2 text-xs text-[#8E8E93]">
+                  {draft.staff.filter((s) => s.employeeId).length > 0 ? `${formatHours(staffTotalDraft)} t på ${draft.staff.filter((s) => s.employeeId).length} medarbejder${draft.staff.filter((s) => s.employeeId).length > 1 ? "e" : ""}` : "Ingen tilføjet"}
+                  <ChevronRight size={16} className="text-[#B4B4BA]" />
+                </span>
+              </button>
+              <button onClick={() => setShowExpensesModal(true)} className="w-full flex items-center justify-between px-4 py-3.5">
+                <span className="text-sm text-[#1C1C1E]">Udlæg</span>
+                <span className="flex items-center gap-2 text-xs text-[#8E8E93]">
+                  {validExpensesDraft.length > 0 ? `${formatDKK(expensesTotalDraft)} kr. på ${validExpensesDraft.length} udlæg` : "Ingen tilføjet"}
+                  <ChevronRight size={16} className="text-[#B4B4BA]" />
+                </span>
+              </button>
+            </div>
+
+            {/* Row 5: Note */}
+            <div className="bg-white rounded-xl border border-[#E2E2E6] shadow-sm p-4">
+              <Field label="Noter">
+                <textarea rows={3} placeholder="Skriv noter her" value={draft.note} onChange={(e) => setDraft({ ...draft, note: e.target.value })} className={inputCls + " resize-none"} />
+              </Field>
+            </div>
+          </>
+        )}
+
+        {page === "arkiv" && (
+          <>
+            {archiveGroups.length === 0 ? (
+              <p className="text-sm text-[#B4B4BA] italic px-1">Ingen registreringer endnu.</p>
+            ) : (
+              <div className="space-y-3">
+                {archiveGroups.map((g) => {
+                  const totalH = g.tid.reduce((s, e) => s + e.hours, 0);
+                  const totalExp = g.udlaeg.reduce((s, e) => s + e.amount, 0);
+                  const revenue = g.tid.reduce((s, e) => s + entryAmount(e), 0);
+                  const staffTotal = g.personale.reduce((s, e) => s + staffCost(e), 0);
+                  const hasNight = g.tid.some((e) => (e.nightHours || 0) > 0) || g.personale.some((e) => (e.nightHours || 0) > 0);
+                  return (
+                    <div key={g.date + g.customerId} className="bg-white rounded-xl border border-[#E2E2E6] overflow-hidden shadow-sm">
+                      <div className="flex items-center justify-between px-4 py-2 bg-[#FAFAFB] border-b border-[#E2E2E6]">
+                        <span className="text-sm font-medium">{formatDateDK(g.date)} <span className="text-[#8E8E93] font-normal">— {weekdayDK(g.date)}</span></span>
+                        <span className="text-xs text-[#3FA9A4] flex items-center gap-1">
+                          {customerName(g.customerId) || "Ingen kunde"}
+                          {hasNight && <Moon size={12} />}
+                        </span>
+                      </div>
+                      <div className="px-4 py-2.5 space-y-1">
+                        {g.tid.map((e) => (
+                          <div key={e.id} className="flex justify-between text-sm">
+                            <span className="text-[#1C1C1E]">{e.project}</span>
+                            <span className="text-[#3FA9A4] font-medium">{formatHours(e.hours)} t</span>
+                          </div>
+                        ))}
+                        {g.personale.map((e) => (
+                          <div key={e.id} className="flex justify-between text-sm">
+                            <span className="text-[#1C1C1E]">Medarbejder — {employeeName(e.employeeId)}</span>
+                            <span className="text-[#3FA9A4] font-medium">{formatHours(e.hours)} t</span>
+                          </div>
+                        ))}
+                        {g.udlaeg.map((e) => {
+                          const { net } = vatSplit(e.amount, e.vatRate ?? 25, e.vatIncl !== false);
+                          return (
+                            <div key={e.id} className="flex justify-between text-sm">
+                              <span className="text-[#8E8E93]">Udlæg — {e.category}</span>
+                              <span className="text-[#1C1C1E]">
+                                {formatDKK(e.amount)} kr.
+                                {(e.vatRate ?? 25) > 0 && <span className="text-[#8E8E93]"> ({formatDKK(net)} u/moms)</span>}
+                              </span>
+                            </div>
+                          );
+                        })}
+                        {revenue > 0 && (
+                          <div className="flex justify-between text-xs text-[#8E8E93] pt-1 border-t border-[#F0F0F3] mt-1">
+                            <span>Beløb (timer × sats)</span>
+                            <span>{formatDKK(revenue)} kr.</span>
+                          </div>
+                        )}
+                        {staffTotal > 0 && (
+                          <div className="flex justify-between text-xs text-[#8E8E93]">
+                            <span>Medarbejderomkostning</span>
+                            <span>{formatDKK(staffTotal)} kr.</span>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-end gap-3 px-4 py-2 border-t border-[#E2E2E6]">
+                        <button onClick={() => editRegistration(g.date, g.customerId)} className="flex items-center gap-1 text-xs text-[#3FA9A4]"><Pencil size={12} /> Redigér</button>
+                        <button onClick={() => deleteRegistration(g.date, g.customerId)} className="flex items-center gap-1 text-xs text-red-500"><Trash2 size={12} /> Slet</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        )}
+
+        {page === "eksport" && (
+          <>
+            <div className="bg-white rounded-xl border border-[#E2E2E6] p-4 space-y-3 shadow-sm">
+              <Field label="Format">
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setExportFormat("numbers")}
+                    className="flex-1 rounded-lg px-3 py-2.5 text-sm font-medium border"
+                    style={exportFormat === "numbers" ? { backgroundColor: "#3FA9A4", borderColor: "#3FA9A4", color: "#ffffff" } : { backgroundColor: "#F0F0F3", borderColor: "#E2E2E6", color: "#8E8E93" }}
+                  >
+                    Numbers
+                  </button>
+                  <button
+                    onClick={() => setExportFormat("pdf")}
+                    className="flex-1 rounded-lg px-3 py-2.5 text-sm font-medium border"
+                    style={exportFormat === "pdf" ? { backgroundColor: "#3FA9A4", borderColor: "#3FA9A4", color: "#ffffff" } : { backgroundColor: "#F0F0F3", borderColor: "#E2E2E6", color: "#8E8E93" }}
+                  >
+                    PDF
+                  </button>
+                </div>
+              </Field>
+              <Field label="Kunde">
+                <select value={exportCustomer} onChange={(e) => setExportCustomer(e.target.value)} className={inputCls}>
+                  <option value="Alle">Alle kunder</option>
+                  {customers.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Fra dato"><input type="date" value={exportFrom} onChange={(e) => setExportFrom(e.target.value)} className={inputCls} /></Field>
+                <Field label="Til dato"><input type="date" value={exportTo} onChange={(e) => setExportTo(e.target.value)} className={inputCls} /></Field>
+              </div>
+              <PrimaryButton onClick={exportFormat === "numbers" ? exportXlsx : exportPdf} disabled={entries.length === 0}>
+                <FileSpreadsheet size={16} /> {exportFormat === "numbers" ? "Del / gem Numbers-fil" : "Eksportér til PDF"}
+              </PrimaryButton>
+              {exportStatus && <p className="text-xs text-center text-[#3FA9A4]">{exportStatus}</p>}
+            </div>
+            {exportFormat === "numbers" ? (
+              <p className="text-xs text-[#8E8E93] px-1">Åbner telefonens Del-vindue, hvor du kan vælge Mail, Gem filer, AirDrop m.m. Filen (.xlsx) indeholder to faner: Timer (dato, job, timer, timesats og beløb) og Udlæg (dato, kategori — fx Parkering og BroBizz — beløb og note).</p>
+            ) : (
+              <p className="text-xs text-[#8E8E93] px-1">Åbner udskriftsdialogen — vælg "Gem som PDF" eller send direkte til en printer. Oversigten viser dato, tid pr. job, udlæg (inkl. Parkering og BroBizz) og noter.</p>
+            )}
+          </>
+        )}
+      </main>
+
+      {/* Fixed footer: save bar (registrering only) stacked directly above nav */}
+      <div className="no-print" style={{ position: "fixed", bottom: 0, left: 0, right: 0, backgroundColor: "#ffffff", borderTop: "1px solid #E2E2E6", zIndex: 30 }}>
+        {page === "registrering" && (
+          <div style={{ padding: "10px 16px 4px", borderBottom: "1px solid #E2E2E6" }}>
+            <div className="max-w-lg mx-auto">
+              <button
+                onClick={saveRegistration}
+                style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: "#3FA9A4", color: "#ffffff", borderRadius: 8, padding: "12px 16px", fontSize: 14, fontWeight: 600, border: "none" }}
+              >
+                {editingIds ? <Check size={16} /> : <Plus size={16} />} {editingIds ? "Gem ændring i arkiv" : "Gem registrering i arkiv"}
+              </button>
+            </div>
+          </div>
+        )}
+        <nav className="px-4 py-2">
+          <div className="max-w-lg mx-auto flex items-center justify-around">
+            {[
+              { id: "registrering", label: "Landingside", icon: Home },
+              { id: "arkiv", label: "Arkiv", icon: Archive },
+              { id: "eksport", label: "Eksportér", icon: FileSpreadsheet },
+            ].map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                onClick={() => {
+                  if (id === "registrering" && page === "arkiv") {
+                    setDraft(emptyDraft());
+                    setEditingIds(null);
+                  }
+                  setPage(id);
+                }}
+                className={`flex flex-col items-center gap-0.5 py-1 px-4 text-[11px] font-medium ${page === id ? "text-[#3FA9A4]" : "text-[#8E8E93]"}`}
+              >
+                <Icon size={20} />
+                {label}
+              </button>
+            ))}
+          </div>
+        </nav>
+      </div>
+
+      {/* ---- Print-only PDF report ---- */}
+      <div className="print-only" style={{ padding: 24, color: "#111", fontFamily: "-apple-system, sans-serif" }}>
+        <h1 style={{ fontSize: 20, fontWeight: 700, marginBottom: 2 }}>Timeoversigt</h1>
+        <p style={{ fontSize: 12, color: "#555", marginBottom: 16 }}>
+          {exportCustomer !== "Alle" ? customerName(exportCustomer) : "Alle kunder"}
+          {(exportFrom || exportTo) && ` · ${exportFrom ? formatDateDK(exportFrom) : "start"} – ${exportTo ? formatDateDK(exportTo) : "nu"}`}
+        </p>
+        {exportByDate.length === 0 && <p>Ingen registreringer i den valgte periode.</p>}
+        {exportByDate.map(({ date, tid, udlaeg, personale }) => (
+          <div key={date} style={{ marginBottom: 18, breakInside: "avoid" }}>
+            <div style={{ fontSize: 13, fontWeight: 600, borderBottom: "1px solid #ccc", paddingBottom: 4, marginBottom: 6 }}>
+              {formatDateDK(date)} — {weekdayDK(date)}
+            </div>
+            {tid.length > 0 && (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 6 }}>
+                <thead>
+                  <tr style={{ textAlign: "left", color: "#555" }}>
+                    <th style={{ padding: "3px 6px 3px 0" }}>Kunde</th>
+                    <th style={{ padding: "3px 6px" }}>Job</th>
+                    <th style={{ padding: "3px 6px" }}>Timer</th>
+                    <th style={{ padding: "3px 6px" }}>Beløb</th>
+                    <th style={{ padding: "3px 0" }}>Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tid.map((e) => (
+                    <tr key={e.id}>
+                      <td style={{ padding: "3px 6px 3px 0" }}>{customerName(e.customerId)}</td>
+                      <td style={{ padding: "3px 6px" }}>{e.project}</td>
+                      <td style={{ padding: "3px 6px" }}>{formatHours(e.hours)} t</td>
+                      <td style={{ padding: "3px 6px" }}>{formatDKK(entryAmount(e))} kr.</td>
+                      <td style={{ padding: "3px 0" }}>{e.note}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {personale.length > 0 && (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 6 }}>
+                <thead>
+                  <tr style={{ textAlign: "left", color: "#555" }}>
+                    <th style={{ padding: "3px 6px 3px 0" }}>Medarbejder</th>
+                    <th style={{ padding: "3px 6px" }}>Kunde</th>
+                    <th style={{ padding: "3px 6px" }}>Timer</th>
+                    <th style={{ padding: "3px 6px" }}>Omkostning</th>
+                    <th style={{ padding: "3px 0" }}>Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {personale.map((e) => (
+                    <tr key={e.id}>
+                      <td style={{ padding: "3px 6px 3px 0" }}>{employeeName(e.employeeId)}</td>
+                      <td style={{ padding: "3px 6px" }}>{customerName(e.customerId)}</td>
+                      <td style={{ padding: "3px 6px" }}>{formatHours(e.hours)} t</td>
+                      <td style={{ padding: "3px 6px" }}>{formatDKK(staffCost(e))} kr.</td>
+                      <td style={{ padding: "3px 0" }}>{e.note}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {udlaeg.length > 0 && (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr style={{ textAlign: "left", color: "#555" }}>
+                    <th style={{ padding: "3px 6px 3px 0" }}>Udlæg</th>
+                    <th style={{ padding: "3px 6px" }}>Kategori</th>
+                    <th style={{ padding: "3px 6px" }}>Beløb</th>
+                    <th style={{ padding: "3px 6px" }}>Beløb u/moms</th>
+                    <th style={{ padding: "3px 0" }}>Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {udlaeg.map((e) => {
+                    const { net } = vatSplit(e.amount, e.vatRate ?? 25, e.vatIncl !== false);
+                    return (
+                      <tr key={e.id}>
+                        <td style={{ padding: "3px 6px 3px 0" }}>{customerName(e.customerId)}</td>
+                        <td style={{ padding: "3px 6px" }}>{e.category}</td>
+                        <td style={{ padding: "3px 6px" }}>{formatDKK(e.amount)} kr.</td>
+                        <td style={{ padding: "3px 6px" }}>{formatDKK(net)} kr.</td>
+                        <td style={{ padding: "3px 0" }}>{e.note}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        ))}
+        <div style={{ marginTop: 20, paddingTop: 8, borderTop: "2px solid #111", fontSize: 13, fontWeight: 600, display: "flex", justifyContent: "space-between" }}>
+          <span>
+            I alt: {formatHours(exportEntries.filter((e) => e.type === "tid").reduce((s, e) => s + e.hours, 0))} timer
+          </span>
+          <span>
+            Udlæg: {formatDKK(exportEntries.filter((e) => e.type === "udlaeg").reduce((s, e) => s + e.amount, 0))} kr.
+          </span>
+        </div>
+      </div>
+
+      {showTimeModal && (
+        <ModalShell title="Tid" onClose={() => setShowTimeModal(false)} onSave={() => setShowTimeModal(false)}>
+          <div>
+            <p className="text-sm font-semibold mb-2">Skriv tiden:</p>
+            <div className="flex gap-2">
+              <input type="text" inputMode="decimal" placeholder="timer" value={draft.manualH} onChange={(e) => setDraft({ ...draft, manualH: e.target.value, start: "", end: "" })} className={inputCls + " w-20"} />
+              <input type="text" inputMode="decimal" placeholder="min" value={draft.manualM} onChange={(e) => setDraft({ ...draft, manualM: e.target.value, start: "", end: "" })} className={inputCls + " w-20"} />
+            </div>
+          </div>
+          <p className="text-center text-sm text-[#8E8E93]">eller</p>
+          <div>
+            <p className="text-sm font-semibold mb-2">Benyt uret:</p>
+            <div className="space-y-2">
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-[#8E8E93] w-10">Fra:</span>
+                <input type="time" value={draft.start} onChange={(e) => setDraft({ ...draft, start: e.target.value, manualH: "", manualM: "" })} className={inputCls} />
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-[#8E8E93] w-10">Til:</span>
+                <input type="time" value={draft.end} onChange={(e) => setDraft({ ...draft, end: e.target.value, manualH: "", manualM: "" })} className={inputCls} />
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center justify-between text-sm px-1">
+            <span className="text-[#8E8E93]">Timer ialt:</span>
+            <span className="font-medium">{formatHours(totalHours)}</span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm text-[#8E8E93] w-16">Privat:</span>
+            <input type="text" inputMode="decimal" placeholder="timer" value={draft.privateH} onChange={(e) => setDraft({ ...draft, privateH: e.target.value })} className={inputCls + " w-20"} />
+            <input type="text" inputMode="decimal" placeholder="min" value={draft.privateM} onChange={(e) => setDraft({ ...draft, privateM: e.target.value })} className={inputCls + " w-20"} />
+          </div>
+          <div className="flex items-center justify-between px-1">
+            <span className="text-sm font-semibold">Arbejdstimer:</span>
+            <span className="text-lg font-semibold text-[#3FA9A4]">{formatHours(arbejdstimer)}</span>
+          </div>
+        </ModalShell>
+      )}
+
+      {/* ---- Nattillæg modal ---- */}
+      {showNightModal && (
+        <ModalShell title="Nattillæg" onClose={() => setShowNightModal(false)} onSave={() => setShowNightModal(false)}>
+          <p className="text-xs text-[#8E8E93]">Angiv hvor mange af registreringens arbejdstimer ({formatHours(arbejdstimer)} t) der skal have nattillæg.</p>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm text-[#8E8E93] w-16">Nattetimer:</span>
+            <input type="text" inputMode="decimal" placeholder="timer" value={draft.nightH} onChange={(e) => setDraft({ ...draft, nightH: e.target.value })} className={inputCls + " w-20"} />
+            <input type="text" inputMode="decimal" placeholder="min" value={draft.nightM} onChange={(e) => setDraft({ ...draft, nightM: e.target.value })} className={inputCls + " w-20"} />
+          </div>
+          <Field label="Nattillæg (kr./t)">
+            <input
+              type="text"
+              inputMode="decimal"
+              placeholder="0,00"
+              value={draft.nightRate}
+              onChange={(e) => setDraft({ ...draft, nightRate: e.target.value })}
+              className={inputCls}
+            />
+          </Field>
+          <div className="flex items-center justify-between px-1 text-sm">
+            <span className="text-[#8E8E93]">Nattetimer (maks {formatHours(arbejdstimer)} t)</span>
+            <span className="font-medium">{formatHours(nightHoursValue)} t</span>
+          </div>
+          {nightHoursValue > 0 && (
+            <div className="flex items-center justify-between px-1 text-sm">
+              <span className="text-[#8E8E93]">Ekstra beløb for nattetimer</span>
+              <span className="font-semibold text-[#3FA9A4]">
+                {formatDKK(nightHoursValue * (parseFloat(String(draft.nightRate).replace(",", ".")) || 0))} kr.
+              </span>
+            </div>
+          )}
+          <p className="text-xs text-[#8E8E93]">De øvrige {formatHours(Math.max(0, arbejdstimer - nightHoursValue))} t faktureres til normal timesats. Fordeles automatisk på dine job under "Fordel på jobs".</p>
+        </ModalShell>
+      )}
+      {showJobsModal && (
+        <ModalShell
+          title="Jobs"
+          onClose={() => setShowJobsModal(false)}
+          onSave={() => setShowJobsModal(false)}
+          subHeader={
+            <div style={{ padding: "10px 16px", backgroundColor: "#FAFAFB", borderBottom: "1px solid #E2E2E6" }}>
+              <div className="flex items-center justify-between text-sm font-semibold">
+                <span>Timer ialt:</span>
+                <span style={{ color: jobsTotal !== arbejdstimer && arbejdstimer > 0 ? "#d97706" : "#3FA9A4" }}>{formatHours(jobsTotal)} t</span>
+              </div>
+              {jobsTotal !== arbejdstimer && arbejdstimer > 0 && (
+                <p className="text-xs mt-0.5" style={{ color: "#d97706" }}>Matcher ikke Arbejdstimer ({formatHours(arbejdstimer)} t) fra Tid</p>
+              )}
+            </div>
+          }
+        >
+          <div className="space-y-4">
+            {draft.jobs.map((j, i) => (
+              <div key={j.id} className="border-t border-[#E2E2E6] pt-3 first:border-t-0 first:pt-0">
+                <div className="flex items-center gap-2 mb-2">
+                  {addingJobFor === j.id ? (
+                    <>
+                      <input
+                        type="text"
+                        autoFocus
+                        placeholder="Nyt jobnavn"
+                        value={newJobNameInput}
+                        onChange={(e) => setNewJobNameInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && newJobNameInput.trim()) {
+                            addJobName(newJobNameInput);
+                            updateJob(j.id, { project: newJobNameInput.trim() });
+                            setNewJobNameInput("");
+                            setAddingJobFor(null);
+                          }
+                        }}
+                        className={inputCls}
+                      />
+                      <button
+                        onClick={() => {
+                          if (!newJobNameInput.trim()) { setAddingJobFor(null); return; }
+                          addJobName(newJobNameInput);
+                          updateJob(j.id, { project: newJobNameInput.trim() });
+                          setNewJobNameInput("");
+                          setAddingJobFor(null);
+                        }}
+                        className="text-[#3FA9A4] shrink-0"
+                      >
+                        <Check size={18} />
+                      </button>
+                      <button onClick={() => { setAddingJobFor(null); setNewJobNameInput(""); }} className="text-[#B4B4BA] shrink-0"><X size={18} /></button>
+                    </>
+                  ) : (
+                    <>
+                      <select
+                        value={j.project}
+                        onChange={(e) => {
+                          if (e.target.value === "__add__") {
+                            setAddingJobFor(j.id);
+                            setNewJobNameInput("");
+                          } else {
+                            updateJob(j.id, { project: e.target.value });
+                          }
+                        }}
+                        className={inputCls}
+                      >
+                        <option value="">Vælg job</option>
+                        {jobNames.map((name) => <option key={name} value={name}>{name}</option>)}
+                        <option value="__add__">+ Nyt job…</option>
+                      </select>
+                      {draft.jobs.length > 1 && <button onClick={() => removeJobRow(j.id)} className="text-[#B4B4BA] hover:text-red-500 shrink-0"><Trash2 size={16} /></button>}
+                    </>
+                  )}
+                </div>
+                <div className="flex gap-2 mb-2">
+                  <input type="text" inputMode="decimal" placeholder="tim." value={j.h} onChange={(e) => updateJob(j.id, { h: e.target.value })} className={inputCls + " w-20"} />
+                  <input type="text" inputMode="decimal" placeholder="min" value={j.m} onChange={(e) => updateJob(j.id, { m: e.target.value })} className={inputCls + " w-20"} />
+                </div>
+                <textarea rows={2} placeholder="Note til jobbet" value={j.note} onChange={(e) => updateJob(j.id, { note: e.target.value })} className={inputCls + " resize-none"} />
+              </div>
+            ))}
+          </div>
+          {jobNames.length > 0 && (
+            <div className="border-t border-[#E2E2E6] pt-3">
+              <p className="text-xs text-[#8E8E93] mb-2">Gemte jobnavne</p>
+              <div className="flex flex-wrap gap-1.5">
+                {jobNames.map((name) => (
+                  <span key={name} className="flex items-center gap-1 bg-[#F0F0F3] rounded-full pl-2.5 pr-1.5 py-1 text-xs">
+                    {name}
+                    <button onClick={() => removeJobName(name)} className="text-[#B4B4BA] hover:text-red-500"><X size={12} /></button>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          <button onClick={addJobRow} className="w-full flex items-center justify-center gap-2 text-sm text-[#3FA9A4] border border-dashed border-[#3FA9A4]/40 rounded-lg py-2.5">
+            <Plus size={15} /> Tilføj job
+          </button>
+        </ModalShell>
+      )}
+
+      {/* ---- Medarbejdere modal ---- */}
+      {showStaffModal && (
+        <ModalShell
+          title="Medarbejdere"
+          onClose={() => setShowStaffModal(false)}
+          onSave={() => setShowStaffModal(false)}
+          subHeader={
+            <div style={{ padding: "10px 16px", backgroundColor: "#FAFAFB", borderBottom: "1px solid #E2E2E6" }}>
+              <div className="flex items-center justify-between text-sm font-semibold">
+                <span>Timer ialt:</span>
+                <span style={{ color: "#3FA9A4" }}>{formatHours(staffTotalDraft)} t</span>
+              </div>
+            </div>
+          }
+        >
+          <div className="space-y-4">
+            {draft.staff.map((s) => (
+              <div key={s.id} className="border-t border-[#E2E2E6] pt-3 first:border-t-0 first:pt-0">
+                <div className="flex items-center gap-2 mb-2">
+                  {addingEmpFor === s.id ? (
+                    <div className="flex-1 space-y-2">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          autoFocus
+                          placeholder="Nyt medarbejdernavn"
+                          value={newEmpNameInput}
+                          onChange={(e) => setNewEmpNameInput(e.target.value)}
+                          className={inputCls}
+                        />
+                        <button
+                          onClick={() => {
+                            if (!newEmpNameInput.trim()) { setAddingEmpFor(null); return; }
+                            const id = addEmployeeName(newEmpNameInput, newEmpWageInput, newEmpNightRateInput);
+                            if (id) updateStaff(s.id, { employeeId: id });
+                            setNewEmpNameInput("");
+                            setNewEmpWageInput("");
+                            setNewEmpNightRateInput("");
+                            setAddingEmpFor(null);
+                          }}
+                          className="text-[#3FA9A4] shrink-0"
+                        >
+                          <Check size={18} />
+                        </button>
+                        <button onClick={() => { setAddingEmpFor(null); setNewEmpNameInput(""); setNewEmpWageInput(""); setNewEmpNightRateInput(""); }} className="text-[#B4B4BA] shrink-0"><X size={18} /></button>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          placeholder="Timeløn (kr./t)"
+                          value={newEmpWageInput}
+                          onChange={(e) => setNewEmpWageInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && newEmpNameInput.trim()) {
+                              const id = addEmployeeName(newEmpNameInput, newEmpWageInput, newEmpNightRateInput);
+                              if (id) updateStaff(s.id, { employeeId: id });
+                              setNewEmpNameInput("");
+                              setNewEmpWageInput("");
+                              setNewEmpNightRateInput("");
+                              setAddingEmpFor(null);
+                            }
+                          }}
+                          className={inputCls}
+                        />
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          placeholder="Nattillæg (kr./t)"
+                          value={newEmpNightRateInput}
+                          onChange={(e) => setNewEmpNightRateInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && newEmpNameInput.trim()) {
+                              const id = addEmployeeName(newEmpNameInput, newEmpWageInput, newEmpNightRateInput);
+                              if (id) updateStaff(s.id, { employeeId: id });
+                              setNewEmpNameInput("");
+                              setNewEmpWageInput("");
+                              setNewEmpNightRateInput("");
+                              setAddingEmpFor(null);
+                            }
+                          }}
+                          className={inputCls}
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <select
+                        value={s.employeeId}
+                        onChange={(e) => {
+                          if (e.target.value === "__add__") {
+                            setAddingEmpFor(s.id);
+                            setNewEmpNameInput("");
+                          } else {
+                            updateStaff(s.id, { employeeId: e.target.value });
+                          }
+                        }}
+                        className={inputCls}
+                      >
+                        <option value="">Vælg medarbejder</option>
+                        {employees.map((emp) => <option key={emp.id} value={emp.id}>{emp.name}</option>)}
+                        <option value="__add__">+ Ny medarbejder…</option>
+                      </select>
+                      {draft.staff.length > 1 && <button onClick={() => removeStaffRow(s.id)} className="text-[#B4B4BA] hover:text-red-500 shrink-0"><Trash2 size={16} /></button>}
+                    </>
+                  )}
+                </div>
+                <div className="flex gap-2 mb-2">
+                  <input type="text" inputMode="decimal" placeholder="tim." value={s.h} onChange={(e) => updateStaff(s.id, { h: e.target.value })} className={inputCls + " w-20"} />
+                  <input type="text" inputMode="decimal" placeholder="min" value={s.m} onChange={(e) => updateStaff(s.id, { m: e.target.value })} className={inputCls + " w-20"} />
+                </div>
+                <div className="flex items-center gap-2 mb-2">
+                  <Moon size={13} className="text-[#8E8E93] shrink-0" />
+                  <input type="text" inputMode="decimal" placeholder="nat tim." value={s.nightH} onChange={(e) => updateStaff(s.id, { nightH: e.target.value })} className={inputCls + " w-20"} />
+                  <input type="text" inputMode="decimal" placeholder="nat min" value={s.nightM} onChange={(e) => updateStaff(s.id, { nightM: e.target.value })} className={inputCls + " w-20"} />
+                </div>
+                <textarea rows={2} placeholder="Note til medarbejderen" value={s.note} onChange={(e) => updateStaff(s.id, { note: e.target.value })} className={inputCls + " resize-none"} />
+              </div>
+            ))}
+          </div>
+          {employees.length > 0 && (
+            <div className="border-t border-[#E2E2E6] pt-3">
+              <p className="text-xs text-[#8E8E93] mb-2">Gemte medarbejdere</p>
+              <div className="flex flex-wrap gap-1.5">
+                {employees.map((emp) => (
+                  <span key={emp.id} className="flex items-center gap-1 bg-[#F0F0F3] rounded-full pl-2.5 pr-1.5 py-1 text-xs">
+                    {emp.name} · {formatDKK(emp.hourlyWage)} kr./t{emp.nightRate > 0 ? ` · +${formatDKK(emp.nightRate)} nat` : ""}
+                    <button onClick={() => { setEditingEmployeeId(emp.id); setEmployeeForm({ name: emp.name, hourlyWage: String(emp.hourlyWage), nightRate: String(emp.nightRate || "") }); }} className="text-[#B4B4BA] hover:text-[#3FA9A4]"><Pencil size={12} /></button>
+                    <button onClick={() => removeEmployee(emp.id)} className="text-[#B4B4BA] hover:text-red-500"><X size={12} /></button>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {editingEmployeeId && (
+            <div className="border-t border-[#E2E2E6] pt-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-[#8E8E93]">Rediger medarbejder</p>
+                <button onClick={() => { setEditingEmployeeId(null); setEmployeeForm(emptyEmployeeForm); }} className="text-xs text-[#8E8E93]">Annullér</button>
+              </div>
+              <input
+                type="text"
+                placeholder="Medarbejdernavn"
+                value={employeeForm.name}
+                onChange={(e) => setEmployeeForm({ ...employeeForm, name: e.target.value })}
+                onKeyDown={(e) => { if (e.key === "Enter") saveEmployee(); }}
+                className={inputCls}
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="Timeløn (kr./t)"
+                  value={employeeForm.hourlyWage}
+                  onChange={(e) => setEmployeeForm({ ...employeeForm, hourlyWage: e.target.value })}
+                  onKeyDown={(e) => { if (e.key === "Enter") saveEmployee(); }}
+                  className={inputCls}
+                />
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="Nattillæg (kr./t)"
+                  value={employeeForm.nightRate}
+                  onChange={(e) => setEmployeeForm({ ...employeeForm, nightRate: e.target.value })}
+                  onKeyDown={(e) => { if (e.key === "Enter") saveEmployee(); }}
+                  className={inputCls}
+                />
+              </div>
+              <button
+                type="button"
+                onClick={saveEmployee}
+                style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: "#3FA9A4", color: "#ffffff", borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 600, border: "none" }}
+              >
+                <Check size={15} /> Gem ændring
+              </button>
+            </div>
+          )}
+          <button onClick={addStaffRow} className="w-full flex items-center justify-center gap-2 text-sm text-[#3FA9A4] border border-dashed border-[#3FA9A4]/40 rounded-lg py-2.5">
+            <Plus size={15} /> Tilføj medarbejder
+          </button>
+        </ModalShell>
+      )}
+
+      {/* ---- Udlæg modal ---- */}
+      {showExpensesModal && (
+        <ModalShell
+          title="Udlæg"
+          onClose={() => setShowExpensesModal(false)}
+          onSave={() => setShowExpensesModal(false)}
+          subHeader={
+            validExpensesDraft.length > 0 && (
+              <div style={{ padding: "10px 16px", backgroundColor: "#FAFAFB", borderBottom: "1px solid #E2E2E6" }}>
+                <div className="flex items-center justify-between text-sm font-semibold">
+                  <span>I alt:</span>
+                  <span className="text-[#3FA9A4]">{formatDKK(expensesTotalDraft)} kr.</span>
+                </div>
+              </div>
+            )
+          }
+        >
+          <div className="space-y-3">
+            {draft.expenses.map((x) => {
+              const { net } = vatSplit(parseFloat(String(x.amount).replace(",", ".")) || 0, parseFloat(x.vatRate) || 0, x.vatIncl);
+              return (
+                <div key={x.id} className="border-t border-[#E2E2E6] pt-3 first:border-t-0 first:pt-0 space-y-2">
+                  <div className="grid grid-cols-4 gap-2">
+                    <select value={x.category} onChange={(e) => updateExpense(x.id, { category: e.target.value })} className={inputCls + " col-span-2"}>
+                      {EXPENSE_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                    <input type="text" inputMode="decimal" placeholder="0,00 kr." value={x.amount} onChange={(e) => updateExpense(x.id, { amount: e.target.value })} className={inputCls} />
+                    {x.receiptImage ? (
+                      <div className="relative w-full h-[42px]">
+                        <img src={x.receiptImage} alt="" onClick={() => setLightboxImage(x.receiptImage)} className="w-full h-full object-cover rounded-lg border border-[#E2E2E6] cursor-pointer" />
+                        <button onClick={() => updateExpense(x.id, { receiptImage: null })} className="absolute -top-1.5 -right-1.5 bg-[#1C1C1E] text-white rounded-full p-0.5"><X size={10} /></button>
+                      </div>
+                    ) : (
+                      <label className="flex items-center justify-center w-full h-[42px] bg-[#F0F0F3] border border-dashed border-[#D0D0D6] rounded-lg text-[#8E8E93] cursor-pointer">
+                        {uploadingReceipt === x.id ? <span className="text-[10px]">…</span> : <Camera size={16} />}
+                        <input type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => handleReceiptSelect(x.id, e.target.files?.[0])} />
+                      </label>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <select value={x.vatRate} onChange={(e) => updateExpense(x.id, { vatRate: e.target.value })} className={inputCls + " w-20 shrink-0"}>
+                      <option value="25">25%</option>
+                      <option value="0">0%</option>
+                    </select>
+                    <label className="flex items-center gap-1.5 text-xs text-[#8E8E93] shrink-0">
+                      <input type="checkbox" checked={x.vatIncl} onChange={(e) => updateExpense(x.id, { vatIncl: e.target.checked })} className="accent-[#3FA9A4]" />
+                      Inkl. moms
+                    </label>
+                  </div>
+                  <p className="text-xs text-[#8E8E93]">Uden moms: <span className="font-medium text-[#1C1C1E]">{formatDKK(net)} kr.</span></p>
+                  <div className="flex items-center gap-2">
+                    <input type="text" placeholder="Note (valgfrit)" value={x.note} onChange={(e) => updateExpense(x.id, { note: e.target.value })} className={inputCls} />
+                    {draft.expenses.length > 1 && <button onClick={() => removeExpenseRow(x.id)} className="text-[#B4B4BA] hover:text-red-500 shrink-0"><Trash2 size={16} /></button>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <button onClick={addExpenseRow} className="w-full flex items-center justify-center gap-2 text-sm text-[#3FA9A4] border border-dashed border-[#3FA9A4]/40 rounded-lg py-2.5">
+            <Plus size={15} /> Tilføj udlæg
+          </button>
+        </ModalShell>
+      )}
+
+      {/* ---- Customer management modal ---- */}
+      {showCustomerModal && (
+        <ModalShell
+          title="Kunder"
+          onClose={() => setShowCustomerModal(false)}
+          onSave={() => (customerForm.name.trim() ? saveCustomer() : setShowCustomerModal(false))}
+          saveLabel={customerForm.name.trim() ? (editingCustomerId ? "Gem" : "Tilføj") : "Luk"}
+        >
+          {customers.length > 0 && (
+            <div className="divide-y divide-[#E2E2E6] border border-[#E2E2E6] rounded-lg overflow-hidden">
+              {customers.map((c) => (
+                <div key={c.id} className="flex items-center gap-2 px-3 py-2.5">
+                  <div className="flex-1">
+                    <div className="text-sm font-medium">{c.name}</div>
+                    <div className="text-xs text-[#8E8E93]">
+                      {formatDKK(c.hourlyRate)} kr./t
+                      {c.nightRate > 0 && <span> · +{formatDKK(c.nightRate)} kr./t nat</span>}
+                    </div>
+                  </div>
+                  <button onClick={() => { setEditingCustomerId(c.id); setCustomerForm({ name: c.name, hourlyRate: String(c.hourlyRate), nightRate: String(c.nightRate || "") }); }} className="text-[#B4B4BA] hover:text-[#3FA9A4]"><Pencil size={14} /></button>
+                  <button onClick={() => removeCustomer(c.id)} className="text-[#B4B4BA] hover:text-red-500"><Trash2 size={14} /></button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="border-t border-[#E2E2E6] pt-3 space-y-2">
+            <p className="text-xs text-[#8E8E93]">{editingCustomerId ? "Rediger kunde" : "Ny kunde"}</p>
+            <input
+              type="text"
+              placeholder="Kundenavn"
+              value={customerForm.name}
+              onChange={(e) => setCustomerForm({ ...customerForm, name: e.target.value })}
+              onKeyDown={(e) => { if (e.key === "Enter") saveCustomer(); }}
+              className={inputCls}
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                type="text"
+                inputMode="decimal"
+                placeholder="Timesats (kr./t)"
+                value={customerForm.hourlyRate}
+                onChange={(e) => setCustomerForm({ ...customerForm, hourlyRate: e.target.value })}
+                onKeyDown={(e) => { if (e.key === "Enter") saveCustomer(); }}
+                className={inputCls}
+              />
+              <input
+                type="text"
+                inputMode="decimal"
+                placeholder="Nattillæg (kr./t)"
+                value={customerForm.nightRate}
+                onChange={(e) => setCustomerForm({ ...customerForm, nightRate: e.target.value })}
+                onKeyDown={(e) => { if (e.key === "Enter") saveCustomer(); }}
+                className={inputCls}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={saveCustomer}
+              style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: "#3FA9A4", color: "#ffffff", borderRadius: 8, padding: "10px 16px", fontSize: 14, fontWeight: 600, border: "none" }}
+            >
+              {editingCustomerId ? <Check size={15} /> : <Plus size={15} />} {editingCustomerId ? "Gem ændring" : "Tilføj kunde"}
+            </button>
+          </div>
+        </ModalShell>
+      )}
+
+      {lightboxImage && (
+        <div onClick={() => setLightboxImage(null)} className="no-print fixed inset-0 bg-black/70 flex items-center justify-center p-6 z-50">
+          <button onClick={() => setLightboxImage(null)} className="absolute top-5 right-5 text-white bg-black/40 rounded-full p-2"><X size={20} /></button>
+          <img src={lightboxImage} alt="" onClick={(e) => e.stopPropagation()} className="max-w-full max-h-full rounded-lg" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
